@@ -1,0 +1,417 @@
+import pandas as pd
+from lxml import etree
+from datetime import datetime
+import os
+from typing import Dict, Optional, Any, List
+from lxml.etree import _Element
+
+def extract_ares_data(xml_file_path: str) -> Dict[str, pd.DataFrame]:
+    """
+    Extrahuje data z ARES XML souboru do pandas dataframes.
+    
+    Funkce načte XML soubor obsahující výpis z ARES a extrahuje z něj:
+    - Základní údaje o subjektu (název, ICO, sídlo, atd.)
+    - Členy představenstva včetně historických změn
+    - Členy kontrolní komise
+    - Předměty podnikání
+    
+    Args:
+        xml_file_path (str): Cesta k XML souboru s výpisem z ARES
+        
+    Returns:
+        Dict[str, pd.DataFrame]: Slovník obsahující čtyři dataframes:
+            - 'zakladni_udaje': Základní informace o subjektu
+            - 'predstavenstvo': Seznam všech členů představenstva
+            - 'kontrolni_komise': Seznam členů kontrolní komise
+            - 'predmety_podnikani': Seznam předmětů podnikání
+            
+    Raises:
+        FileNotFoundError: Pokud soubor neexistuje
+        etree.XMLSyntaxError: Pokud XML soubor má neplatný formát
+    """
+    
+    # Načtení XML souboru s UTF-8 kódováním
+    with open(xml_file_path, 'r', encoding='utf-8') as file:
+        xml_content = file.read()
+    
+    # Parsování XML pomocí lxml knihovny
+    root = etree.fromstring(xml_content.encode('utf-8'))
+    
+    # Definice namespace pro ARES XML dokumenty
+    ns = {'are': 'http://wwwinfo.mfcr.cz/ares/xml_doc/schemas/ares/ares_answer_vreo/v_1.0.0'}
+    
+    # Extrakce jednotlivých částí dat
+    zakladni_udaje = extract_basic_info(root, ns)
+    predstavenstvo = extract_board_members(root, ns)
+    kontrolni_komise = extract_audit_committee(root, ns)
+    predmety_podnikani = extract_business_activities(root, ns)
+    
+    return {
+        'zakladni_udaje': zakladni_udaje,
+        'predstavenstvo': predstavenstvo,
+        'kontrolni_komise': kontrolni_komise,
+        'predmety_podnikani': predmety_podnikani
+    }
+
+def extract_basic_info(root: _Element, ns: Dict[str, str]) -> pd.DataFrame:
+    """
+    Extrahuje základní údaje o subjektu z XML dokumentu.
+    
+    Získává informace jako ICO, název, právní forma, sídlo a datum zápisu.
+    
+    Args:
+        root (_Element): Kořenový element XML dokumentu
+        ns (Dict[str, str]): Slovník s namespace definicemi
+        
+    Returns:
+        pd.DataFrame: DataFrame s jedním řádkem obsahujícím základní údaje
+                     nebo prázdný DataFrame pokud údaje nejsou k dispozici
+    """
+    
+    # Najdeme element se základními údaji
+    zakladni_udaje_elem = root.find('.//are:Zakladni_udaje', ns)
+    
+    if zakladni_udaje_elem is None:
+        return pd.DataFrame()
+    
+    # Vytvoření slovníku s všemi základními údaji
+    data = {
+        # Identifikační údaje
+        'ICO': safe_get_text(zakladni_udaje_elem.find('are:ICO', ns)),
+        'ObchodniFirma': safe_get_text(zakladni_udaje_elem.find('are:ObchodniFirma', ns)),
+        
+        # Právní forma
+        'PravniForma_Kod': safe_get_text(zakladni_udaje_elem.find('are:PravniForma/are:Kod_PF', ns)),
+        'PravniForma_Nazev': safe_get_text(zakladni_udaje_elem.find('are:PravniForma/are:Nazev_PF', ns)),
+        
+        # Datum zápisu do rejstříku
+        'DatumZapisu': safe_get_text(zakladni_udaje_elem.find('are:DatumZapisu', ns)),
+        
+        # Údaje o sídle - jednotlivé komponenty
+        'Sidlo_Ulice': safe_get_text(zakladni_udaje_elem.find('are:Sidlo/are:ulice', ns)),
+        'Sidlo_CisloPop': safe_get_text(zakladni_udaje_elem.find('are:Sidlo/are:cisloPop', ns)),
+        'Sidlo_CisloOr': safe_get_text(zakladni_udaje_elem.find('are:Sidlo/are:cisloOr', ns)),
+        'Sidlo_PSC': safe_get_text(zakladni_udaje_elem.find('are:Sidlo/are:psc', ns)),
+        'Sidlo_Obec': safe_get_text(zakladni_udaje_elem.find('are:Sidlo/are:obec', ns)),
+        'Sidlo_Okres': safe_get_text(zakladni_udaje_elem.find('are:Sidlo/are:okres', ns)),
+        
+        # Celá adresa jako jeden text
+        'Sidlo_Text': safe_get_text(zakladni_udaje_elem.find('are:Sidlo/are:text', ns))
+    }
+    
+    return pd.DataFrame([data])
+
+def extract_board_members(root: _Element, ns: Dict[str, str]) -> pd.DataFrame:
+    """
+    Extrahuje všechny členy představenstva včetně historických změn.
+    
+    Funkce projde všechny členy statutárního orgánu a extrahuje jejich:
+    - Osobní údaje (jméno, příjmení, tituly, datum narození)
+    - Funkce a období jejich výkonu
+    - Adresy
+    - Data začátku a konce členství
+    
+    Args:
+        root (_Element): Kořenový element XML dokumentu
+        ns (Dict[str, str]): Slovník s namespace definicemi
+        
+    Returns:
+        pd.DataFrame: DataFrame obsahující všechny členy představenstva
+                     s kompletními údaji včetně historických změn
+    """
+    
+    members_data = []
+    
+    # Najdeme všechny členy statutárního orgánu (představenstva)
+    members = root.findall('.//are:Statutarni_organ/are:Clen', ns)
+    
+    for member in members:
+        # Základní časové údaje o členství
+        member_data = {
+            'DatumZacatku': member.get('dza'),  # Datum začátku členství
+            'DatumVykonu': member.get('dvy'),   # Datum výkonu/konce členství
+        }
+        
+        # Extrakce informací o funkci
+        funkce_elem = member.find('are:funkce', ns)
+        if funkce_elem is not None:
+            member_data['Funkce'] = safe_get_text(funkce_elem.find('are:nazev', ns))
+            member_data['FunkceZacatek'] = funkce_elem.get('dza')  # Začátek výkonu funkce
+            member_data['FunkceKonec'] = funkce_elem.get('dvy')    # Konec výkonu funkce
+            member_data['FunkceVznik'] = safe_get_text(funkce_elem.find('are:vznikFunkce', ns))
+            member_data['FunkceZanik'] = safe_get_text(funkce_elem.find('are:zanikFunkce', ns))
+        
+        # Extrakce osobních údajů
+        fosoba_elem = member.find('are:fosoba', ns)
+        if fosoba_elem is not None:
+            # Jméno a příjmení
+            member_data['Jmeno'] = safe_get_text(fosoba_elem.find('are:jmeno', ns))
+            member_data['Prijmeni'] = safe_get_text(fosoba_elem.find('are:prijmeni', ns))
+            
+            # Tituly
+            member_data['TitulPred'] = safe_get_text(fosoba_elem.find('are:titulPred', ns))
+            member_data['TitulZa'] = safe_get_text(fosoba_elem.find('are:titulZa', ns))
+            
+            # Osobní identifikátory
+            member_data['DatumNarozeni'] = safe_get_text(fosoba_elem.find('are:datumNarozeni', ns))
+            member_data['RodneCislo'] = safe_get_text(fosoba_elem.find('are:rodneCislo', ns))
+            member_data['Obcanstvi'] = safe_get_text(fosoba_elem.find('are:obcanstvi', ns))
+            
+            # Extrakce adresy
+            adresa_elem = fosoba_elem.find('are:adresa', ns)
+            if adresa_elem is not None:
+                member_data['Adresa_Ulice'] = safe_get_text(adresa_elem.find('are:ulice', ns))
+                member_data['Adresa_CisloPop'] = safe_get_text(adresa_elem.find('are:cisloPop', ns))
+                member_data['Adresa_CisloOr'] = safe_get_text(adresa_elem.find('are:cisloOr', ns))
+                member_data['Adresa_PSC'] = safe_get_text(adresa_elem.find('are:psc', ns))
+                member_data['Adresa_Obec'] = safe_get_text(adresa_elem.find('are:obec', ns))
+                member_data['Adresa_Okres'] = safe_get_text(adresa_elem.find('are:okres', ns))
+                member_data['Adresa_Text'] = safe_get_text(adresa_elem.find('are:text', ns))
+        
+        # Informace o členství (vznik a zánik)
+        clenstvi_elem = member.find('are:clenstvi', ns)
+        if clenstvi_elem is not None:
+            member_data['ClenstviVznik'] = safe_get_text(clenstvi_elem.find('are:vznikClenstvi', ns))
+            member_data['ClenstviZanik'] = safe_get_text(clenstvi_elem.find('are:zanikClenstvi', ns))
+        
+        members_data.append(member_data)
+    
+    return pd.DataFrame(members_data)
+
+def extract_audit_committee(root: _Element, ns: Dict[str, str]) -> pd.DataFrame:
+    """
+    Extrahuje členy kontrolní komise z XML dokumentu.
+    
+    Kontrolní komise je uvedena jako "jiný orgán" v ARES dokumentu.
+    Extrahuje základní údaje o členech včetně jejich funkcí.
+    
+    Args:
+        root (_Element): Kořenový element XML dokumentu
+        ns (Dict[str, str]): Slovník s namespace definicemi
+        
+    Returns:
+        pd.DataFrame: DataFrame obsahující členy kontrolní komise
+                     s jejich osobními údaji a funkcemi
+    """
+    
+    committee_data = []
+    
+    # Najdeme všechny členy jiného orgánu (kontrolní komise)
+    members = root.findall('.//are:Jiny_organ/are:Clen', ns)
+    
+    for member in members:
+        # Základní údaje o členství
+        member_data = {
+            'DatumZacatku': member.get('dza'),  # Datum začátku členství
+        }
+        
+        # Extrakce funkce v kontrolní komisi
+        funkce_elem = member.find('are:funkce', ns)
+        if funkce_elem is not None:
+            member_data['Funkce'] = safe_get_text(funkce_elem.find('are:nazev', ns))
+            member_data['FunkceVznik'] = safe_get_text(funkce_elem.find('are:vznikFunkce', ns))
+        
+        # Extrakce osobních údajů
+        fosoba_elem = member.find('are:fosoba', ns)
+        if fosoba_elem is not None:
+            # Základní identifikace
+            member_data['Jmeno'] = safe_get_text(fosoba_elem.find('are:jmeno', ns))
+            member_data['Prijmeni'] = safe_get_text(fosoba_elem.find('are:prijmeni', ns))
+            member_data['TitulPred'] = safe_get_text(fosoba_elem.find('are:titulPred', ns))
+            
+            # Osobní údaje
+            member_data['DatumNarozeni'] = safe_get_text(fosoba_elem.find('are:datumNarozeni', ns))
+            member_data['RodneCislo'] = safe_get_text(fosoba_elem.find('are:rodneCislo', ns))
+            
+            # Adresa (jen jako celý text)
+            adresa_elem = fosoba_elem.find('are:adresa', ns)
+            if adresa_elem is not None:
+                member_data['Adresa_Text'] = safe_get_text(adresa_elem.find('are:text', ns))
+        
+        # Informace o členství
+        clenstvi_elem = member.find('are:clenstvi', ns)
+        if clenstvi_elem is not None:
+            member_data['ClenstviVznik'] = safe_get_text(clenstvi_elem.find('are:vznikClenstvi', ns))
+            member_data['ClenstviZanik'] = safe_get_text(clenstvi_elem.find('are:zanikClenstvi', ns))
+        
+        committee_data.append(member_data)
+    
+    return pd.DataFrame(committee_data)
+
+def extract_business_activities(root: _Element, ns: Dict[str, str]) -> pd.DataFrame:
+    """
+    Extrahuje všechny předměty podnikání ze základních údajů.
+    
+    Předměty podnikání definují, jaké činnosti může subjekt vykonávat.
+    
+    Args:
+        root (_Element): Kořenový element XML dokumentu
+        ns (Dict[str, str]): Slovník s namespace definicemi
+        
+    Returns:
+        pd.DataFrame: DataFrame obsahující seznam všech předmětů podnikání
+    """
+    
+    activities_data = []
+    
+    # Najdeme všechny předměty podnikání v sekci činností
+    activities = root.findall('.//are:Cinnosti/are:PredmetPodnikani/are:Text', ns)
+    
+    for activity in activities:
+        activities_data.append({
+            'PredmetPodnikani': safe_get_text(activity)
+        })
+    
+    return pd.DataFrame(activities_data)
+
+def safe_get_text(element: Optional[_Element]) -> Optional[str]:
+    """
+    Bezpečně získá textový obsah z XML elementu.
+    
+    Funkce kontroluje, zda element existuje, a pokud ano, vrátí jeho textový obsah.
+    Pokud element neexistuje nebo je None, vrátí None.
+    
+    Args:
+        element (Optional[_Element]): XML element nebo None
+        
+    Returns:
+        Optional[str]: Textový obsah elementu nebo None
+    """
+    return element.text if element is not None else None
+
+def save_to_excel(data_dict: Dict[str, pd.DataFrame], output_file: str) -> None:
+    """
+    Uloží všechny dataframes do Excel souboru s různými listy.
+    
+    Každý dataframe bude uložen na samostatný list v Excel souboru.
+    Prázdné dataframes jsou přeskočeny.
+    
+    Args:
+        data_dict (Dict[str, pd.DataFrame]): Slovník s dataframes k uložení
+        output_file (str): Cesta k výstupnímu Excel souboru
+        
+    Returns:
+        None
+    """
+    
+    # Použití ExcelWriter pro uložení více listů najednou
+    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+        for sheet_name, df in data_dict.items():
+            # Uložíme pouze neprázdné dataframes
+            if not df.empty:
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+    
+    print(f"Data byla uložena do souboru: {output_file}")
+
+def main() -> Optional[Dict[str, pd.DataFrame]]:
+    """
+    Hlavní funkce pro spuštění extrakce dat z ARES XML souboru.
+    
+    Funkce:
+    1. Načte XML soubor
+    2. Extrahuje všechna data do dataframes
+    3. Zobrazí základní informace a statistiky
+    4. Uloží data do Excel souboru
+    
+    Returns:
+        Optional[Dict[str, pd.DataFrame]]: Extrahovaná data nebo None při chybě
+    """
+    
+    # Nastavení cesty k XML souboru - ZMĚŇTE PODLE POTŘEBY
+    xml_file = "00039276.xml"
+    
+    # Kontrola existence souboru
+    if not os.path.exists(xml_file):
+        print(f"Soubor {xml_file} nebyl nalezen!")
+        print("Změňte cestu k souboru v proměnné 'xml_file'")
+        return None
+    
+    try:
+        # Extrakce dat z XML souboru
+        print("Extrahuji data z XML souboru...")
+        data = extract_ares_data(xml_file)
+        
+        # Zobrazení základních informací o subjektu
+        print("\n" + "="*50)
+        print("ZÁKLADNÍ ÚDAJE O SUBJEKTU")
+        print("="*50)
+        
+        if not data['zakladni_udaje'].empty:
+            basic_info = data['zakladni_udaje'].iloc[0]
+            print(f"ICO: {basic_info['ICO']}")
+            print(f"Název: {basic_info['ObchodniFirma']}")
+            print(f"Právní forma: {basic_info['PravniForma_Nazev']}")
+            print(f"Datum zápisu: {basic_info['DatumZapisu']}")
+            print(f"Sídlo: {basic_info['Sidlo_Text']}")
+        else:
+            print("Základní údaje nejsou k dispozici")
+        
+        # Zobrazení statistik o extrahovaných datech
+        print(f"\n" + "="*50)
+        print("STATISTIKY EXTRAHOVANÝCH DAT")
+        print("="*50)
+        print(f"Počet záznamů o členech představenstva: {len(data['predstavenstvo'])}")
+        print(f"Počet členů kontrolní komise: {len(data['kontrolni_komise'])}")
+        print(f"Počet předmětů podnikání: {len(data['predmety_podnikani'])}")
+        
+        # Zobrazení aktuálních členů představenstva
+        print(f"\n" + "="*50)
+        print("AKTUÁLNÍ PŘEDSTAVENSTVO")
+        print("="*50)
+        
+        # Filtrujeme pouze aktuální členy (bez data výkonu a bez zániku členství)
+        current_board = data['predstavenstvo'][
+            (data['predstavenstvo']['DatumVykonu'].isna()) | 
+            (data['predstavenstvo']['ClenstviZanik'].isna())
+        ]
+        
+        if not current_board.empty:
+            for _, member in current_board.iterrows():
+                # Sestavíme celé jméno včetně titulů
+                name_parts = []
+                if pd.notna(member['TitulPred']) and member['TitulPred']:
+                    name_parts.append(member['TitulPred'])
+                if pd.notna(member['Jmeno']):
+                    name_parts.append(member['Jmeno'])
+                if pd.notna(member['Prijmeni']):
+                    name_parts.append(member['Prijmeni'])
+                
+                name = " ".join(name_parts)
+                function = member['Funkce'] if pd.notna(member['Funkce']) else 'Člen představenstva'
+                print(f"• {function}: {name}")
+        else:
+            print("Žádní aktuální členové představenstva nebyli nalezeni")
+        
+        # Zobrazení předmětů podnikání
+        print(f"\n" + "="*50)
+        print("PŘEDMĚTY PODNIKÁNÍ")
+        print("="*50)
+        
+        if not data['predmety_podnikani'].empty:
+            for _, activity in data['predmety_podnikani'].iterrows():
+                print(f"• {activity['PredmetPodnikani']}")
+        else:
+            print("Žádné předměty podnikání nebyly nalezeny")
+        
+        # Uložení do Excel souboru
+        output_file = "ares_data.xlsx"
+        print(f"\n" + "="*50)
+        print("UKLÁDÁNÍ DAT")
+        print("="*50)
+        save_to_excel(data, output_file)
+        
+        return data
+        
+    except FileNotFoundError:
+        print(f"Chyba: Soubor {xml_file} nebyl nalezen!")
+        return None
+    except etree.XMLSyntaxError as e:
+        print(f"Chyba při parsování XML: {e}")
+        return None
+    except Exception as e:
+        print(f"Neočekávaná chyba při zpracování XML souboru: {e}")
+        return None
+
+# Spuštění programu pouze pokud je spuštěn přímo (ne jako modul)
+if __name__ == "__main__":
+    extracted_data = main()
