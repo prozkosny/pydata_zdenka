@@ -1,0 +1,16 @@
+
+import pandas as pd
+import pyodbc
+
+conn = pyodbc.connect(
+    'DRIVER={ODBC Driver 18 for SQL Server};'
+    'SERVER=tcp:skoleni.database.windows.net,1433;'
+    'DATABASE=skoleni;'
+    'UID=rozkosny;'
+    'PWD=Libalova.1;'
+    'Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;'
+)
+
+df = pd.read_sql("SELECT TOP 10 * FROM data_nova", conn)
+df.flags
+print(df.head())
