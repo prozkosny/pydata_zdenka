@@ -1,0 +1,36 @@
+
+import pandas as pd
+url ='https://raw.githubusercontent.com/petrrozkosny/pydata/refs/heads/main/pydata_data.csv'
+
+
+
+df = pd.read_csv(url,sep=";")
+df["DATE"] = pd.to_datetime(df["DATE"])
+df = df.assign(ROK=df["DATE"].dt.year,MESIC=df["DATE"].dt.month,DEN=df["DATE"].dt.day)
+
+dates = pd.date_range("2000-01-01","2000-12-31",freq="D")
+dates = dates.to_frame()
+dates = dates.rename(columns={0:"DATE"})
+dates = dates.assign(MESIC=dates["DATE"].dt.month,DEN=dates["DATE"].dt.day)
+
+df_r_2000 = df.loc[(df["NAME"]=="RUZYNE")&(df["ROK"] == 2000)]
+df_r_2001 = df.loc[(df["NAME"]=="RUZYNE")&(df["ROK"] == 2001)]
+
+dates = pd.merge(left=dates,right=df_r_2000[["MESIC", "DEN", "PRCP"]],left_on=["MESIC","DEN"],right_on=["MESIC","DEN"])
+dates = pd.merge(left=dates,right=df_r_2001[["MESIC", "DEN", "PRCP"]],left_on=["MESIC","DEN"],right_on=["MESIC","DEN"],suffixes=("","_2001"))
+dates = dates.rename(columns={"PRCP":"PRCP_2000"})
+dates["DATE_STR"] = dates["DATE"].dt.strftime(date_format="%m-%d")
+dates["PRCP_2000"] = dates["PRCP_2000"].cumsum()
+dates["PRCP_2001"] = dates["PRCP_2001"].cumsum()
+
+from matplotlib import pyplot as plt
+
+fig, ax = plt.subplots(4,1,figsize=(10,7))
+
+ax[0].plot(dates["DATE"],dates["PRCP_2000"],label="2000")
+ax[0].plot(dates["DATE"],dates["PRCP_2001"],label="2001")
+
+ax[0].legend()
+plt.show()
+
+
